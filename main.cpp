@@ -68,6 +68,9 @@ struct Team {
     // Update team status after a submission
     void update_submission(const string& problem, SubmissionStatus status, int time, bool is_frozen_period) {
         ProblemStatus& prob = problems[problem];
+        // Save current state for comparison
+        int old_solved = (prob.solve_time != -1) ? 1 : 0;
+        int old_penalty = (prob.solve_time != -1) ? (20 * prob.wrong_attempts + prob.solve_time) : 0;
 
         if (prob.solve_time != -1) {
             // Already solved, do nothing
@@ -120,6 +123,8 @@ private:
     int duration_time = 0;
     int problem_count = 0;
     vector<string> problem_names;
+    mutable vector<Team*> cached_rankings;
+    mutable bool rankings_dirty = true;
 
     // Get problem name from index (A, B, C, ...)
     string get_problem_name(int idx) const {
@@ -135,14 +140,18 @@ private:
         return SubmissionStatus::WRONG_ANSWER;  // default
     }
 
-    // Calculate rankings
-    vector<Team*> calculate_rankings() {
-        vector<Team*> rankings;
-        for (auto& [name, team] : teams) {
-            rankings.push_back(team.get());
+    // Calculate rankings (with caching)
+    vector<Team*> calculate_rankings() const {
+        if (!rankings_dirty) {
+            return cached_rankings;
         }
 
-        sort(rankings.begin(), rankings.end(), [](Team* a, Team* b) {
+        cached_rankings.clear();
+        for (auto& [name, team] : teams) {
+            cached_rankings.push_back(team.get());
+        }
+
+        sort(cached_rankings.begin(), cached_rankings.end(), [](Team* a, Team* b) {
             // First compare by solved count
             if (a->solved_count != b->solved_count) {
                 return a->solved_count > b->solved_count;
@@ -168,7 +177,8 @@ private:
             return a->name < b->name;
         });
 
-        return rankings;
+        rankings_dirty = false;
+        return cached_rankings;
     }
 
     // Get team ranking (1-indexed)
@@ -224,6 +234,7 @@ public:
                                team->problems[problem].solve_time == -1;
 
         team->update_submission(problem, status, time, is_frozen_period);
+        rankings_dirty = true;  // Mark rankings as dirty
     }
 
     // Flush scoreboard
@@ -264,52 +275,45 @@ public:
             result << "\n";
         }
 
-        // Keep scrolling until no frozen problems remain
-        while (true) {
-            // Find the lowest-ranked team with frozen problems
-            auto current_rankings = calculate_rankings();
-            Team* lowest_team = nullptr;
-            string lowest_problem;
-            bool found_frozen = false;
+        // Pre-calculate which teams have frozen problems
+        vector<pair<Team*, string>> frozen_problems;
+        auto current_rankings = calculate_rankings();
 
-            // Search from bottom to top
-            for (int i = current_rankings.size() - 1; i >= 0; i--) {
-                Team* team = current_rankings[i];
+        // Search from bottom to top to find all frozen problems
+        for (int i = current_rankings.size() - 1; i >= 0; i--) {
+            Team* team = current_rankings[i];
 
-                // Find the frozen problem with smallest ID (A, B, C...)
-                for (const string& prob_name : problem_names) {
-                    if (team->problems[prob_name].is_frozen) {
-                        lowest_team = team;
-                        lowest_problem = prob_name;
-                        found_frozen = true;
-                        break;
-                    }
+            // Find all frozen problems for this team
+            for (const string& prob_name : problem_names) {
+                if (team->problems[prob_name].is_frozen) {
+                    frozen_problems.push_back({team, prob_name});
                 }
-                if (found_frozen) break;
             }
+        }
 
-            if (!found_frozen) break;  // No more frozen problems
-
+        // Process each frozen problem
+        for (auto [team, prob_name] : frozen_problems) {
             // Get current rankings before unfreezing
-            int old_ranking = get_team_ranking(lowest_team->name);
+            int old_ranking = get_team_ranking(team->name);
 
             // Unfreeze this problem
-            lowest_team->problems[lowest_problem].is_frozen = false;
+            team->problems[prob_name].is_frozen = false;
+            rankings_dirty = true;  // Mark rankings as dirty
 
             // Get new rankings
-            int new_ranking = get_team_ranking(lowest_team->name);
+            int new_ranking = get_team_ranking(team->name);
 
             // If ranking improved, output the change
             if (new_ranking < old_ranking) {
                 // Find which team was displaced
                 auto new_rankings = calculate_rankings();
                 string displaced_team;
-                if (new_ranking <= new_rankings.size()) {
+                if (new_ranking <= (int)new_rankings.size()) {
                     displaced_team = new_rankings[new_ranking - 1]->name;
                 }
 
-                result << lowest_team->name << " " << displaced_team << " "
-                       << lowest_team->solved_count << " " << lowest_team->total_penalty << "\n";
+                result << team->name << " " << displaced_team << " "
+                       << team->solved_count << " " << team->total_penalty << "\n";
             }
         }
 
