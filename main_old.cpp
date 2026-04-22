@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <sstream>
 #include <memory>
-#include <unordered_map>
 
 using namespace std;
 
@@ -63,13 +62,15 @@ struct Team {
     int solved_count = 0;
     int total_penalty = 0;
     vector<int> solve_times;  // for tie-breaking
-    bool has_frozen = false;  // Quick check if team has frozen problems
 
     Team(const string& n) : name(n) {}
 
     // Update team status after a submission
     void update_submission(const string& problem, SubmissionStatus status, int time, bool is_frozen_period) {
         ProblemStatus& prob = problems[problem];
+        // Save current state for comparison
+        int old_solved = (prob.solve_time != -1) ? 1 : 0;
+        int old_penalty = (prob.solve_time != -1) ? (20 * prob.wrong_attempts + prob.solve_time) : 0;
 
         if (prob.solve_time != -1) {
             // Already solved, do nothing
@@ -79,7 +80,6 @@ struct Team {
         if (is_frozen_period && !prob.is_frozen) {
             // Enter frozen state
             prob.is_frozen = true;
-            has_frozen = true;
         }
 
         if (is_frozen_period) {
@@ -97,25 +97,20 @@ struct Team {
         }
     }
 
-    // Check if this team has any frozen problems
-    bool check_frozen_problems(const vector<string>& problem_names) {
-        has_frozen = false;
-        for (const string& prob : problem_names) {
-            if (problems[prob].is_frozen) {
-                has_frozen = true;
-                break;
-            }
-        }
-        return has_frozen;
+    // Unfreeze a problem (used during scroll)
+    bool unfreeze_problem(const string& problem) {
+        ProblemStatus& prob = problems[problem];
+        if (!prob.is_frozen) return false;
+
+        prob.is_frozen = false;
+
+        // Check if we have any frozen submissions that were accepted
+        // Since we don't know the actual status of frozen submissions,
+        // we need to check if the problem was actually solved
+        // This is handled externally by re-processing submissions
+
+        return true;
     }
-};
-
-// Team pointer with ranking info for efficient sorting
-struct RankedTeam {
-    Team* team;
-    int rank;
-
-    RankedTeam(Team* t, int r) : team(t), rank(r) {}
 };
 
 class ICPCManager {
@@ -128,8 +123,8 @@ private:
     int duration_time = 0;
     int problem_count = 0;
     vector<string> problem_names;
-    vector<RankedTeam> current_rankings;
-    bool rankings_valid = false;
+    mutable vector<Team*> cached_rankings;
+    mutable bool rankings_dirty = true;
 
     // Get problem name from index (A, B, C, ...)
     string get_problem_name(int idx) const {
@@ -145,80 +140,56 @@ private:
         return SubmissionStatus::WRONG_ANSWER;  // default
     }
 
-    // Update rankings efficiently
-    void update_rankings() {
-        if (rankings_valid) return;
-
-        current_rankings.clear();
-        for (auto& [name, team] : teams) {
-            current_rankings.emplace_back(team.get(), 0);
+    // Calculate rankings (with caching)
+    vector<Team*> calculate_rankings() const {
+        if (!rankings_dirty) {
+            return cached_rankings;
         }
 
-        sort(current_rankings.begin(), current_rankings.end(), [](const RankedTeam& a, const RankedTeam& b) {
-            Team* ta = a.team;
-            Team* tb = b.team;
+        cached_rankings.clear();
+        for (auto& [name, team] : teams) {
+            cached_rankings.push_back(team.get());
+        }
 
+        sort(cached_rankings.begin(), cached_rankings.end(), [](Team* a, Team* b) {
             // First compare by solved count
-            if (ta->solved_count != tb->solved_count) {
-                return ta->solved_count > tb->solved_count;
+            if (a->solved_count != b->solved_count) {
+                return a->solved_count > b->solved_count;
             }
 
             // Then by penalty time
-            if (ta->total_penalty != tb->total_penalty) {
-                return ta->total_penalty < tb->total_penalty;
+            if (a->total_penalty != b->total_penalty) {
+                return a->total_penalty < b->total_penalty;
             }
 
             // Then by solve times (descending order)
-            int min_size = min(ta->solve_times.size(), tb->solve_times.size());
+            int min_size = min(a->solve_times.size(), b->solve_times.size());
             for (int i = 0; i < min_size; i++) {
-                if (ta->solve_times[i] != tb->solve_times[i]) {
-                    return ta->solve_times[i] < tb->solve_times[i];
+                if (a->solve_times[i] != b->solve_times[i]) {
+                    return a->solve_times[i] < b->solve_times[i];
                 }
             }
-            if (ta->solve_times.size() != tb->solve_times.size()) {
-                return ta->solve_times.size() > tb->solve_times.size();
+            if (a->solve_times.size() != b->solve_times.size()) {
+                return a->solve_times.size() > b->solve_times.size();
             }
 
             // Finally by team name
-            return ta->name < tb->name;
+            return a->name < b->name;
         });
 
-        // Update ranks
-        for (int i = 0; i < current_rankings.size(); i++) {
-            current_rankings[i].rank = i + 1;
-        }
-
-        rankings_valid = true;
+        rankings_dirty = false;
+        return cached_rankings;
     }
 
     // Get team ranking (1-indexed)
     int get_team_ranking(const string& team_name) {
-        update_rankings();
-        for (const auto& rt : current_rankings) {
-            if (rt.team->name == team_name) {
-                return rt.rank;
+        auto rankings = calculate_rankings();
+        for (int i = 0; i < rankings.size(); i++) {
+            if (rankings[i]->name == team_name) {
+                return i + 1;
             }
         }
         return -1;  // not found
-    }
-
-    // Output scoreboard
-    string output_scoreboard() {
-        update_rankings();
-        stringstream result;
-
-        for (const auto& rt : current_rankings) {
-            Team* team = rt.team;
-            result << team->name << " " << rt.rank << " " << team->solved_count
-                   << " " << team->total_penalty;
-
-            for (const string& prob_name : problem_names) {
-                result << " " << team->problems[prob_name].get_display_string();
-            }
-            result << "\n";
-        }
-
-        return result.str();
     }
 
 public:
@@ -231,7 +202,6 @@ public:
             return "[Error]Add failed: duplicated team name.\n";
         }
         teams[team_name] = make_unique<Team>(team_name);
-        rankings_valid = false;
         return "[Info]Add successfully.\n";
     }
 
@@ -264,12 +234,11 @@ public:
                                team->problems[problem].solve_time == -1;
 
         team->update_submission(problem, status, time, is_frozen_period);
-        rankings_valid = false;
+        rankings_dirty = true;  // Mark rankings as dirty
     }
 
     // Flush scoreboard
     string flush_scoreboard() {
-        rankings_valid = false;
         return "[Info]Flush scoreboard.\n";
     }
 
@@ -291,18 +260,30 @@ public:
         stringstream result;
         result << "[Info]Scroll scoreboard.\n";
 
+        // First flush the scoreboard
+        auto rankings_before = calculate_rankings();
+
         // Output scoreboard before scrolling
-        result << output_scoreboard();
+        for (int i = 0; i < rankings_before.size(); i++) {
+            Team* team = rankings_before[i];
+            result << team->name << " " << (i + 1) << " " << team->solved_count
+                   << " " << team->total_penalty;
 
-        // Collect all frozen problems efficiently
+            for (const string& prob_name : problem_names) {
+                result << " " << team->problems[prob_name].get_display_string();
+            }
+            result << "\n";
+        }
+
+        // Pre-calculate which teams have frozen problems
         vector<pair<Team*, string>> frozen_problems;
-        update_rankings();
+        auto current_rankings = calculate_rankings();
 
-        // Search from bottom to top to find frozen problems in correct order
+        // Search from bottom to top to find all frozen problems
         for (int i = current_rankings.size() - 1; i >= 0; i--) {
-            Team* team = current_rankings[i].team;
+            Team* team = current_rankings[i];
 
-            // Find frozen problems for this team
+            // Find all frozen problems for this team
             for (const string& prob_name : problem_names) {
                 if (team->problems[prob_name].is_frozen) {
                     frozen_problems.push_back({team, prob_name});
@@ -317,7 +298,7 @@ public:
 
             // Unfreeze this problem
             team->problems[prob_name].is_frozen = false;
-            rankings_valid = false;
+            rankings_dirty = true;  // Mark rankings as dirty
 
             // Get new rankings
             int new_ranking = get_team_ranking(team->name);
@@ -325,10 +306,10 @@ public:
             // If ranking improved, output the change
             if (new_ranking < old_ranking) {
                 // Find which team was displaced
-                update_rankings();
+                auto new_rankings = calculate_rankings();
                 string displaced_team;
-                if (new_ranking <= (int)current_rankings.size()) {
-                    displaced_team = current_rankings[new_ranking - 1].team->name;
+                if (new_ranking <= (int)new_rankings.size()) {
+                    displaced_team = new_rankings[new_ranking - 1]->name;
                 }
 
                 result << team->name << " " << displaced_team << " "
@@ -337,7 +318,17 @@ public:
         }
 
         // Output final scoreboard after scrolling
-        result << output_scoreboard();
+        auto final_rankings = calculate_rankings();
+        for (int i = 0; i < final_rankings.size(); i++) {
+            Team* team = final_rankings[i];
+            result << team->name << " " << (i + 1) << " " << team->solved_count
+                   << " " << team->total_penalty;
+
+            for (const string& prob_name : problem_names) {
+                result << " " << team->problems[prob_name].get_display_string();
+            }
+            result << "\n";
+        }
 
         is_frozen = false;
         return result.str();
@@ -376,13 +367,12 @@ public:
 
             if (sub.team != team_name) continue;
             if (problem != "ALL" && sub.problem != problem) continue;
-            if (status != "ALL") {
-                bool match = false;
-                if (status == "Accepted" && sub.status == SubmissionStatus::ACCEPTED) match = true;
-                else if (status == "Wrong_Answer" && sub.status == SubmissionStatus::WRONG_ANSWER) match = true;
-                else if (status == "Runtime_Error" && sub.status == SubmissionStatus::RUNTIME_ERROR) match = true;
-                else if (status == "Time_Limit_Exceed" && sub.status == SubmissionStatus::TIME_LIMIT_EXCEED) match = true;
-                if (!match) continue;
+            if (status != "ALL" &&
+                (status == "Accepted" && sub.status != SubmissionStatus::ACCEPTED) &&
+                (status == "Wrong_Answer" && sub.status != SubmissionStatus::WRONG_ANSWER) &&
+                (status == "Runtime_Error" && sub.status != SubmissionStatus::RUNTIME_ERROR) &&
+                (status == "Time_Limit_Exceed" && sub.status != SubmissionStatus::TIME_LIMIT_EXCEED)) {
+                continue;
             }
 
             // Found a match
